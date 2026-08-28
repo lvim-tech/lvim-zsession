@@ -21,19 +21,30 @@ register_plugin!(State);
 
 impl ZellijPlugin for State {
     fn load(&mut self, _configuration: BTreeMap<String, String>) {
-        // SaveSession is gated behind ReadApplicationState (measured against zellij 0.46 — the
-        // denial names it explicitly), counterintuitive as that reads.
-        request_permission(&[PermissionType::ReadApplicationState]);
+        request_permission(&[
+            // SaveSession is gated behind ReadApplicationState (measured against zellij 0.46 —
+            // the denial names it explicitly), counterintuitive as that reads.
+            PermissionType::ReadApplicationState,
+            // the outcome broadcast below
+            PermissionType::MessageAndLaunchOtherPlugins,
+        ]);
     }
 
     fn pipe(&mut self, message: PipeMessage) -> bool {
         if message.name == "save" {
-            // The outcome goes to the zellij log — a background plugin has no pane, and a save is
-            // silent by design; the log line is there when one wonders whether it happened.
-            match save_session() {
-                Ok(()) => eprintln!("lvim-zsession: session saved"),
-                Err(e) => eprintln!("lvim-zsession: session save failed: {e}"),
-            }
+            // The outcome goes to the zellij log, and is BROADCAST as a "notice" pipe — a bar that
+            // listens (lvim-zbar does) shows it next to the tabs; everything else ignores it.
+            let outcome = match save_session() {
+                Ok(()) => {
+                    eprintln!("lvim-zsession: session saved");
+                    "session saved".to_string()
+                }
+                Err(e) => {
+                    eprintln!("lvim-zsession: session save failed: {e}");
+                    format!("session save FAILED: {e}")
+                }
+            };
+            pipe_message_to_plugin(MessageToPlugin::new("notice").with_payload(outcome));
         }
         false
     }
