@@ -21,7 +21,9 @@ register_plugin!(State);
 
 impl ZellijPlugin for State {
     fn load(&mut self, _configuration: BTreeMap<String, String>) {
-        request_permission(&[PermissionType::ChangeApplicationState]);
+        // SaveSession is gated behind ReadApplicationState (measured against zellij 0.46 — the
+        // denial names it explicitly), counterintuitive as that reads.
+        request_permission(&[PermissionType::ReadApplicationState]);
     }
 
     fn pipe(&mut self, message: PipeMessage) -> bool {

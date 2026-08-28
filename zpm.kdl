@@ -3,7 +3,7 @@
 // `file:` URL of the built wasm below.
 plugin {
     wasm "lvim-zsession.wasm"
-    permissions "ChangeApplicationState"
+    permissions "ReadApplicationState"
     keybinds {
         tmux {
             bind "s" { MessagePlugin "{{wasm}}" { name "save"; }; SwitchToMode "normal"; }
