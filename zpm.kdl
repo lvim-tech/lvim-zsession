@@ -1,0 +1,12 @@
+// lvim-zsession — the lvim-zpm manifest. The keybind ships WITH the plugin: in the tmux mode,
+// "s" saves the session to disk immediately (Ctrl s, then s). `{{wasm}}` becomes the absolute
+// `file:` URL of the built wasm below.
+plugin {
+    wasm "lvim-zsession.wasm"
+    permissions "ChangeApplicationState"
+    keybinds {
+        tmux {
+            bind "s" { MessagePlugin "{{wasm}}" { name "save"; }; SwitchToMode "normal"; }
+        }
+    }
+}

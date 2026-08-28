@@ -1,0 +1,15 @@
+[package]
+name = "lvim-zsession"
+version = "0.1.0"
+edition = "2021"
+authors = ["lvim-tech"]
+description = "Session utilities for zellij: save the session to disk from a keybind"
+license = "BSD-3-Clause"
+
+[dependencies]
+zellij-tile = "0.44.3"
+
+[profile.release]
+lto = true
+opt-level = "z"
+strip = true
