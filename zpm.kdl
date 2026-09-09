@@ -1,9 +1,11 @@
-// lvim-zsession — the lvim-zpm manifest. The keybind ships WITH the plugin: in the tmux mode,
-// "s" saves the session to disk immediately (Ctrl s, then s). `{{wasm}}` becomes the absolute
-// `file:` URL of the built wasm below.
+// lvim-zsession — the lvim-zpm manifest. zellij's own session serialization stays ON; the plugin
+// runs in the background and, when a resurrected program pane exits, puts a shell in its place
+// (in the program's directory) instead of leaving a dead pane. One keybind, tmux mode:
+//   Ctrl s, then s  — serialize this session to disk right now (e.g. before logging out)
+// `{{wasm}}` becomes the absolute `file:` URL of the built wasm below.
 plugin {
     wasm "lvim-zsession.wasm"
-    permissions "ReadApplicationState" "MessageAndLaunchOtherPlugins"
+    permissions "ReadApplicationState" "ChangeApplicationState" "RunCommands" "MessageAndLaunchOtherPlugins"
     keybinds {
         tmux {
             bind "s" { MessagePlugin "{{wasm}}" { name "save"; }; SwitchToMode "normal"; }

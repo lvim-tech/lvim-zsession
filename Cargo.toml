@@ -1,9 +1,9 @@
 [package]
 name = "lvim-zsession"
-version = "0.1.0"
+version = "0.5.0"
 edition = "2021"
 authors = ["lvim-tech"]
-description = "Session utilities for zellij: save the session to disk from a keybind"
+description = "Session resurrection companion for zellij: when a resurrected program pane exits, a shell takes its place (no dead pane), plus save-session from a keybind"
 license = "BSD-3-Clause"
 
 [dependencies]
