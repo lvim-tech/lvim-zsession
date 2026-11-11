@@ -149,6 +149,12 @@ impl ZellijPlugin for State {
 
     fn pipe(&mut self, message: PipeMessage) -> bool {
         if let Some(panel) = self.panel.as_mut() {
+            // Opened again while it is up (`open_panel` reaches the running instance instead of
+            // launching one): come forward.
+            if message.name == "open" {
+                show_self(true);
+                return false;
+            }
             if message.name == "lvim-zclaude-summary" {
                 let payload = message.payload.as_deref().unwrap_or("");
                 if !panel::has_per_session(payload) {
@@ -171,8 +177,8 @@ impl ZellijPlugin for State {
         if message.name == "restart" {
             restart();
         }
-        // lvim-zclaude's board asks for the session panel: this instance launches it (or focuses
-        // it), with the same configuration the `Ctrl s s` bind gives it.
+        // The `Ctrl s s` bind and lvim-zclaude's board ask for the session panel: this instance
+        // launches it at its size, or brings it forward (`open_panel`).
         if message.name == "lvim-zsession-open" {
             open_panel();
         }
@@ -988,14 +994,26 @@ fn restart() {
 
 /// The session panel, launched by the background instance the way `Ctrl s s` launches it — the
 /// same URL (`zellij:OWN_URL`) and configuration, so an open panel is focused, not doubled.
+/// Launch the panel — or, when it runs, tell it to come forward (`open`).
+///
+/// **Born at its size.** A pane launched by a keybind (`LaunchOrFocusPlugin`) or the CLI is drawn
+/// at zellij's default floating size (half the screen) and only then moved to its own by the
+/// plugin — a visible jump on every opening. A message from a *plugin* may carry the coordinates
+/// of the pane it launches (`with_floating_pane_coordinates`; zellij ignores them on keybind and
+/// CLI pipes, `plugins/mod.rs`), so every opening goes through this background instance: the
+/// `Ctrl s s` bind and lvim-zclaude's `Ctrl o` send it `lvim-zsession-open`, and the panel's first
+/// frame is already at `SIZE`.
 fn open_panel() {
-    pipe_message_to_plugin(
-        MessageToPlugin::new("open")
-            .with_plugin_url("zellij:OWN_URL")
-            .with_plugin_config(BTreeMap::from([("panel".to_string(), "on".to_string())]))
-            .new_plugin_instance_should_float(true)
-            .new_plugin_instance_should_have_pane_title("sessions"),
-    );
+    let [x, y, w, h] = SIZE.map(|(_, value)| Some(value.to_string()));
+    let mut message = MessageToPlugin::new("open")
+        .with_plugin_url("zellij:OWN_URL")
+        .with_plugin_config(BTreeMap::from([("panel".to_string(), "on".to_string())]))
+        .new_plugin_instance_should_float(true)
+        .new_plugin_instance_should_have_pane_title("sessions");
+    if let Some(coordinates) = FloatingPaneCoordinates::new(x, y, w, h, None, None) {
+        message = message.with_floating_pane_coordinates(coordinates);
+    }
+    pipe_message_to_plugin(message);
 }
 
 fn notice(msg: &str) {
