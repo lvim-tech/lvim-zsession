@@ -7,5 +7,5 @@
 // `{{wasm}}` becomes the absolute `file:` URL of the built wasm below.
 plugin {
     wasm "lvim-zsession.wasm"
-    permissions "ReadApplicationState" "ChangeApplicationState" "RunCommands" "MessageAndLaunchOtherPlugins" "ReadCliPipes"
+    permissions "ReadApplicationState" "ChangeApplicationState" "RunCommands" "MessageAndLaunchOtherPlugins" "ReadCliPipes" "ReadPaneContents"
 }

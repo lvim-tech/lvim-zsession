@@ -108,6 +108,33 @@ pub struct View<'a> {
     pub input: Option<(&'a str, &'a str)>,
     /// What the last action did.
     pub message: Option<&'a str>,
+    /// Under the tabs line: what the selected session's chosen tab shows.
+    pub preview: Option<&'a Preview>,
+    /// zellij's own attention per live session: `(status word, how many, colour slot)`.
+    pub attention: &'a std::collections::BTreeMap<String, Attention>,
+}
+
+/// What a session's chosen tab looks like: a title and its lines, styled as the pane draws them.
+pub struct Preview {
+    pub title: String,
+    pub lines: Vec<String>,
+}
+
+/// zellij's attention for one session, already reduced to what the column shows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Attention {
+    pub symbol: &'static str,
+    pub word: &'static str,
+    pub count: usize,
+    pub tone: Tone,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tone {
+    Waiting,
+    Busy,
+    Done,
+    Muted,
 }
 
 /// A line in the list: a group heading or an item (with its index into `items`).
@@ -136,18 +163,19 @@ pub fn draw(view: &View, rows: usize, cols: usize) {
         fg(pal.map(|p| p.muted), &counts)
     );
 
-    // Columns: ST, SESSION (what is left), TABS, PANES, CLIENTS, AGENTS, LAST.
-    let (w_st, w_tabs, w_panes, w_clients, w_agents, w_last) = (3, 6, 7, 9, 18, 10);
-    let fixed = 2 + w_st + w_tabs + w_panes + w_clients + w_agents + w_last;
+    // Columns: ST, SESSION (what is left), TABS, PANES, CLIENTS, AGENTS, ATTENTION, LAST.
+    let (w_st, w_tabs, w_panes, w_clients, w_agents, w_attn, w_last) = (3, 6, 7, 9, 18, 15, 10);
+    let fixed = 2 + w_st + w_tabs + w_panes + w_clients + w_agents + w_attn + w_last;
     let w_name = cols.saturating_sub(fixed).clamp(8, 32);
     let header = format!(
-        "  {}{}{}{}{}{}{}",
+        "  {}{}{}{}{}{}{}{}",
         pad("ST", w_st),
         pad("SESSION", w_name),
         pad("TABS", w_tabs),
         pad("PANES", w_panes),
         pad("CLIENTS", w_clients),
         pad("AGENTS", w_agents),
+        pad("ATTENTION", w_attn),
         pad("LAST", w_last)
     );
     println!("{}", fg(pal.map(|p| p.heading), &panel::fit(&header, cols)));
@@ -191,8 +219,17 @@ pub fn draw(view: &View, rows: usize, cols: usize) {
         lines.push(Line::Item(i, item));
     }
 
-    // Title, headings, detail, message/input, help: five lines that are always there.
-    let body = rows.saturating_sub(5).max(1);
+    // Title, headings, detail and message/input are four lines that are always there; the help
+    // is as many as it wraps to at this width. What is left is the list's and the preview's: the
+    // list takes what it needs up to three fifths, the preview the rest.
+    let room = rows.saturating_sub(4 + help_height(view, cols)).max(1);
+    let needed = lines.len().max(1);
+    let (body, preview_rows) = if view.preview.is_some() && room >= 10 {
+        let list = needed.min(room - room * 2 / 5).max(3);
+        (list, room - list)
+    } else {
+        (room, 0)
+    };
     let cursor_line = lines
         .iter()
         .position(|l| matches!(l, Line::Item(i, _) if *i == view.cursor))
@@ -216,7 +253,7 @@ pub fn draw(view: &View, rows: usize, cols: usize) {
                     view,
                     item,
                     cols,
-                    (w_st, w_name, w_tabs, w_panes, w_clients, w_agents, w_last),
+                    (w_st, w_name, w_tabs, w_panes, w_clients, w_agents, w_attn, w_last),
                 );
                 let selected = *i == view.cursor;
                 match (selected, pal) {
@@ -236,7 +273,136 @@ pub fn draw(view: &View, rows: usize, cols: usize) {
     }
 
     println!("{}", detail_line(view, cols));
+    if let Some(preview) = view.preview.filter(|_| preview_rows > 0) {
+        draw_preview(view, preview, preview_rows, cols);
+    }
     footer(view, cols);
+}
+
+/// `  ── Tab #1 › nvim ───` and the last lines of the pane under it, in the pane's own colours.
+/// Each line is cut by what is seen and ends with a full reset, so no colour leaks past it.
+fn draw_preview(view: &View, preview: &Preview, rows: usize, cols: usize) {
+    let pal = view.palette;
+    let title = panel::fit(&preview.title, cols.saturating_sub(8));
+    let rule = "─".repeat(cols.saturating_sub(title.chars().count() + 6));
+    println!(
+        "  {} {} {}",
+        fg(pal.map(|p| p.muted), "──"),
+        fg(pal.map(|p| p.title), &title),
+        fg(pal.map(|p| p.muted), &rule)
+    );
+    let body = rows.saturating_sub(1);
+    let lines = trim_blank_tail(&preview.lines);
+    let start = lines.len().saturating_sub(body);
+    let mut drawn = 0;
+    for line in &lines[start..] {
+        println!("  {}", cut_ansi(line, cols.saturating_sub(2)));
+        drawn += 1;
+    }
+    for _ in drawn..body {
+        println!();
+    }
+}
+
+/// A screen dump ends in the empty rows under the prompt; the preview shows the rows with text.
+fn trim_blank_tail(lines: &[String]) -> &[String] {
+    let end = lines
+        .iter()
+        .rposition(|l| !strip_ansi(l).trim().is_empty())
+        .map_or(0, |i| i + 1);
+    &lines[..end]
+}
+
+/// Cut a **styled** line to `width` visible characters: the escapes are copied and not counted,
+/// and a styled line ends in a full reset. (lvim-zclaude's `cut_ansi`.)
+pub fn cut_ansi(text: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let pieces = pieces(text);
+    let visible = pieces.iter().filter(|p| matches!(p, Piece::Char(_))).count();
+    let styled = pieces.iter().any(|p| matches!(p, Piece::Escape(_)));
+    let keep = if visible <= width { visible } else { width - 1 };
+    let mut out = String::new();
+    let mut seen = 0;
+    for piece in &pieces {
+        match piece {
+            Piece::Escape(escape) => out.push_str(escape),
+            Piece::Char(c) if seen < keep => {
+                out.push(*c);
+                seen += 1;
+            }
+            Piece::Char(_) => {}
+        }
+    }
+    if visible > width {
+        out.push('…');
+    }
+    if styled {
+        out.push_str("\u{1b}[0m");
+    }
+    out
+}
+
+pub fn strip_ansi(text: &str) -> String {
+    pieces(text)
+        .into_iter()
+        .filter_map(|p| match p {
+            Piece::Char(c) => Some(c),
+            Piece::Escape(_) => None,
+        })
+        .collect()
+}
+
+enum Piece {
+    Escape(String),
+    Char(char),
+}
+
+fn pieces(text: &str) -> Vec<Piece> {
+    let mut out = Vec::new();
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            // A carriage return or another control character would move the cursor.
+            if !c.is_control() {
+                out.push(Piece::Char(c));
+            }
+            continue;
+        }
+        let mut escape = String::from(c);
+        match chars.next() {
+            Some('[') => {
+                escape.push('[');
+                for d in chars.by_ref() {
+                    escape.push(d);
+                    if ('\u{40}'..='\u{7e}').contains(&d) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                // An OSC (a hyperlink, a title) is dropped: it says nothing a preview shows.
+                while let Some(d) = chars.next() {
+                    if d == '\u{7}' {
+                        break;
+                    }
+                    if d == '\u{1b}' && chars.peek() == Some(&'\\') {
+                        chars.next();
+                        break;
+                    }
+                }
+                continue;
+            }
+            Some(d) => escape.push(d),
+            None => {}
+        }
+        // Only colours and styles (`…m`) are kept: a cursor move would draw the line elsewhere.
+        if escape.ends_with('m') {
+            out.push(Piece::Escape(escape));
+        }
+    }
+    out
 }
 
 /// `  RUST  Tab #1  [Tab #2]` — in the session-name yellow, the chosen tab on the selection
@@ -276,11 +442,11 @@ fn detail_line(view: &View, cols: usize) -> String {
     }
 }
 
-type Widths = (usize, usize, usize, usize, usize, usize, usize);
+type Widths = (usize, usize, usize, usize, usize, usize, usize, usize);
 
 fn item_line(view: &View, item: &Item, cols: usize, w: Widths) -> String {
     let pal = view.palette;
-    let (w_st, w_name, w_tabs, w_panes, w_clients, w_agents, w_last) = w;
+    let (w_st, w_name, w_tabs, w_panes, w_clients, w_agents, w_attn, w_last) = w;
     let row = match item {
         Item::New(name) => {
             let text = match name {
@@ -349,17 +515,23 @@ fn item_line(view: &View, item: &Item, cols: usize, w: Widths) -> String {
     } else {
         pal.map(|p| p.muted)
     };
+    let (attn_text, attn_colour) = match view.attention.get(&row.name).filter(|_| row.is_live()) {
+        Some(a) if a.count > 1 => (format!("{} {} {}", a.symbol, a.count, a.word), tone(pal, a.tone)),
+        Some(a) => (format!("{} {}", a.symbol, a.word), tone(pal, a.tone)),
+        None => ("—".to_string(), pal.map(|p| p.muted)),
+    };
     let line = format!(
-        "  {}{BOLD}{}{UNBOLD}{}{}{}{}{}",
+        "  {}{BOLD}{}{UNBOLD}{}{}{}{}{}{}",
         fg(glyph_colour, &pad(glyph, w_st)),
         fg(name_colour, &pad(&row.name, w_name)),
         fg(pal.map(|p| p.count), &pad(&tabs, w_tabs)),
         fg(pal.map(|p| p.count), &pad(&panes, w_panes)),
         fg(pal.map(|p| p.count), &pad(&clients, w_clients)),
         fg(agents_colour, &pad(&agents_text, w_agents)),
+        fg(attn_colour, &pad(&attn_text, w_attn)),
         fg(last_colour, &pad(&last, w_last)),
     );
-    let used = 2 + w_st + w_name + w_tabs + w_panes + w_clients + w_agents + w_last;
+    let used = 2 + w_st + w_name + w_tabs + w_panes + w_clients + w_agents + w_attn + w_last;
     format!("{line}{}", " ".repeat(cols.saturating_sub(used)))
 }
 
@@ -384,6 +556,15 @@ fn agents_cell(agents: Option<&Agents>, pal: Option<Palette>) -> (String, Option
         format!("{} · {n} {word}", a.total)
     };
     (text, colour)
+}
+
+fn tone(pal: Option<Palette>, tone: Tone) -> Option<PaletteColor> {
+    pal.map(|p| match tone {
+        Tone::Waiting => p.waiting,
+        Tone::Busy => p.busy,
+        Tone::Done => p.done,
+        Tone::Muted => p.muted,
+    })
 }
 
 fn plural(n: usize, word: &str) -> String {
@@ -422,13 +603,28 @@ fn footer(view: &View, cols: usize) {
             fg(pal.map(|p| p.done), &panel::fit(&format!("  {msg}"), cols))
         );
     }
-    let keys: &[(&str, &str)] = if view.input.is_some() {
+    // The last line is printed without a newline: one more would scroll the pane by a line.
+    let lines = help_lines(pal, help_keys(view), cols);
+    let last = lines.len() - 1;
+    for (index, line) in lines.iter().enumerate() {
+        if index == last {
+            print!("{line}");
+        } else {
+            println!("{line}");
+        }
+    }
+}
+
+fn help_keys(view: &View) -> &'static [(&'static str, &'static str)] {
+    if view.input.is_some() {
         &[("Enter", "confirm"), ("Esc", "cancel")]
     } else {
         &[
             ("↑↓", "move"),
             ("Enter", "open"),
             ("←→", "tab"),
+            ("Shift ←→", "pane"),
+            ("Ctrl o", "agents"),
             ("Ctrl n", "new"),
             ("Del", "kill/delete"),
             ("Ctrl r", "rename"),
@@ -436,24 +632,89 @@ fn footer(view: &View, cols: usize) {
             ("Ctrl x", "detach others"),
             ("Esc", "close"),
         ]
-    };
-    let plain: usize = 6 + keys
-        .iter()
-        .map(|(k, w)| k.chars().count() + 6 + w.chars().count())
-        .sum::<usize>();
-    let line = if plain + 2 <= cols {
-        let caps: Vec<String> = keys.iter().map(|(k, w)| keycap(pal, k, w)).collect();
-        format!(
-            "{}{}",
-            fg(pal.map(|p| p.heading), "Help: "),
-            caps.join(&fg(pal.map(|p| p.muted), ", "))
-        )
-    } else {
-        let short: Vec<String> = keys
-            .iter()
-            .map(|(k, _)| fg(pal.map(|p| p.key), &format!("<{k}>")))
-            .collect();
-        short.join(" ")
-    };
-    print!("  {line}");
+    }
+}
+
+/// How many lines the help takes at this width; `draw` leaves them out of the list.
+fn help_height(view: &View, cols: usize) -> usize {
+    help_lines(None, help_keys(view), cols).len()
+}
+
+/// `Help: <Enter> - open, <←→> - tab, …`, **wrapped** to the width: a key and its word are never
+/// split, and the next line starts under the first key. Nothing is dropped — a key that is not
+/// on the screen is a key nobody learns.
+fn help_lines(pal: Option<Palette>, keys: &[(&str, &str)], cols: usize) -> Vec<String> {
+    const LEAD: &str = "  Help: ";
+    let lead = LEAD.chars().count();
+    let room = cols.saturating_sub(lead).max(1);
+    let mut lines: Vec<String> = Vec::new();
+    let mut line = String::new();
+    let mut width = 0usize;
+    for (index, (key, what)) in keys.iter().enumerate() {
+        let comma = index + 1 < keys.len();
+        let seen = key.chars().count() + 5 + what.chars().count() + usize::from(comma);
+        if width > 0 && width + 1 + seen > room {
+            lines.push(std::mem::take(&mut line));
+            width = 0;
+        }
+        if width > 0 {
+            line.push(' ');
+            width += 1;
+        }
+        line.push_str(&keycap(pal, key, what));
+        if comma {
+            line.push_str(&fg(pal.map(|p| p.muted), ","));
+        }
+        width += seen;
+    }
+    lines.push(line);
+    lines
+        .into_iter()
+        .enumerate()
+        .map(|(index, keys)| {
+            if index == 0 {
+                format!("  {}{keys}", fg(pal.map(|p| p.heading), "Help: "))
+            } else {
+                format!("{}{keys}", " ".repeat(lead))
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The help wraps instead of losing its words: every key and word is on the screen and no
+    /// line is wider than the pane.
+    #[test]
+    fn help_wraps_to_the_width() {
+        let keys = [("↑↓", "move"), ("Enter", "open"), ("Ctrl x", "detach others"), ("Esc", "close")];
+        let lines = help_lines(None, &keys, 40);
+        assert!(lines.len() > 1, "{lines:?}");
+        assert!(lines.iter().all(|line| line.chars().count() <= 40), "{lines:?}");
+        let all = lines.join("\n");
+        for (key, what) in keys {
+            assert!(all.contains(&format!("<{key}> - {what}")), "{all}");
+        }
+        assert_eq!(help_lines(None, &keys, 200).len(), 1);
+    }
+
+    /// A pane's screen keeps its colours but loses what would move the cursor, and is cut by
+    /// what is seen.
+    #[test]
+    fn a_preview_line_keeps_colour_and_drops_cursor_moves() {
+        let line = "\u{1b}[31mred\u{1b}[0m \u{1b}[2Kplain\r\u{1b}]8;;http://x\u{1b}\\link";
+        assert_eq!(strip_ansi(line), "red plainlink");
+        let cut = cut_ansi(line, 6);
+        assert_eq!(strip_ansi(&cut), "red p…");
+        assert!(cut.starts_with("\u{1b}[31m") && cut.ends_with("\u{1b}[0m"));
+        assert!(!cut.contains("[2K"));
+    }
+
+    #[test]
+    fn the_blank_rows_under_a_prompt_are_not_previewed() {
+        let lines: Vec<String> = ["$ ls", "a b", "", "\u{1b}[0m  "].map(String::from).to_vec();
+        assert_eq!(trim_blank_tail(&lines).len(), 2);
+    }
 }

@@ -1,15 +1,18 @@
 // The session panel: zellij's session-manager, with what it leaves out.
 //
 // The built-in list shows tabs, panes and clients only for live sessions — a resurrectable one is
-// a name and an age, because `SessionUpdate` gives no more. Its saved layout is on disk, though
-// (`~/.cache/zellij/<contract>/session_info/<name>/session-layout.kdl`), and that says how many
-// tabs and panes it had and which of them ran `claude`. The agents of a live session come from
+// a name and an age, because `SessionUpdate` gives no more. zellij reads its saved layout for us
+// (`get_saved_session_preview` → `SavedSessionPreview`), and that says which tabs and panes it had
+// and which of them ran `claude`. The agents of a live session come from
 // lvim-zclaude, which counts them per zellij session in its summary pipe (lines 3+).
 //
 // Everything here is plain data and text; main.rs does the zellij calls.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
+use zellij_tile::prelude::{AttentionStatus, GlobalAttention, SavedSessionPreview, SavedTabPreview};
+
+use crate::ui::{Attention, Tone};
 
 /// Agents of one live zellij session, from lvim-zclaude.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -121,166 +124,94 @@ pub fn has_per_session(payload: &str) -> bool {
     pairs.split_whitespace().any(|kv| kv == "agents=0")
 }
 
-/// The shell that dumps every saved layout: `\x1e<name>\t<mtime>\n<file>` per session directory.
-pub const SAVED_SCRIPT: &str = r#"for f in "$HOME"/.cache/zellij/*/session_info/*/session-layout.kdl; do [ -f "$f" ] || continue; d=${f%/*}; printf '\036%s\t%s\n' "${d##*/}" "$(stat -c %Y "$f")"; cat "$f"; done"#;
+/// What a saved session brings back, counted from zellij's own reading of its layout.
+pub fn saved_counts(preview: &SavedSessionPreview) -> Saved {
+    let panes = preview.tabs.iter().flat_map(|t| t.panes.iter());
+    Saved {
+        tabs: preview.tabs.len(),
+        panes: panes.clone().count(),
+        agents: panes.filter(|p| p.command.as_deref().is_some_and(runs_claude)).count(),
+    }
+}
 
-/// The dump of `SAVED_SCRIPT` → what each session's layout holds. A name saved under two zellij
-/// contract versions keeps the newer file.
-pub fn parse_saved(out: &str) -> BTreeMap<String, Saved> {
-    newest(out)
-        .into_iter()
-        .map(|(name, body)| (name, count_layout(&body)))
+/// A saved session's tabs in order, and the one it was left on.
+pub fn saved_tabs(preview: &SavedSessionPreview) -> Vec<(String, bool)> {
+    preview
+        .tabs
+        .iter()
+        .map(|t| (t.name.clone(), t.focused))
         .collect()
 }
 
-/// The tabs of each saved layout, in order, with the one that had focus — what the detail line
-/// offers to land on.
-pub fn parse_saved_tabs(out: &str) -> BTreeMap<String, Vec<(String, bool)>> {
-    newest(out)
-        .into_iter()
-        .map(|(name, body)| (name, tab_names(&body)))
-        .collect()
+/// A saved pane by what it runs: its title, its command, or `shell` in its folder.
+pub fn saved_pane_title(pane: &zellij_tile::prelude::SavedPanePreview) -> String {
+    pane.title
+        .clone()
+        .filter(|t| !t.trim().is_empty())
+        .or_else(|| pane.command.clone())
+        .unwrap_or_else(|| "shell".to_string())
 }
 
-/// Each name's layout from the dump, the newer file when a name was saved twice.
-fn newest(out: &str) -> BTreeMap<String, String> {
-    let mut best: BTreeMap<String, (u64, String)> = BTreeMap::new();
-    for chunk in out.split('\x1e').skip(1) {
-        let (head, body) = chunk.split_once('\n').unwrap_or((chunk, ""));
-        let Some((name, mtime)) = head.split_once('\t') else {
-            continue;
-        };
-        let mtime: u64 = mtime.trim().parse().unwrap_or(0);
-        if best.get(name).is_none_or(|(m, _)| mtime >= *m) {
-            best.insert(name.to_string(), (mtime, body.to_string()));
-        }
+/// What a saved tab brings back: one line per pane (`▸` on the chosen one) with its command and
+/// folder, then the chosen pane's last screen when zellij kept it.
+pub fn saved_tab_lines(tab: &SavedTabPreview, chosen: usize) -> Vec<String> {
+    let mut lines: Vec<String> = tab
+        .panes
+        .iter()
+        .enumerate()
+        .map(|(i, pane)| {
+            let mark = if i == chosen { "▸" } else { " " };
+            let what = match &pane.command {
+                Some(command) => format!("$ {command}"),
+                None => "shell".to_string(),
+            };
+            match &pane.cwd {
+                Some(cwd) => format!("{mark} {what}   {cwd}"),
+                None => format!("{mark} {what}"),
+            }
+        })
+        .collect();
+    if let Some(contents) = tab.panes.get(chosen).and_then(|p| p.contents.as_ref()) {
+        lines.push(String::new());
+        lines.extend(contents.lines().map(str::to_string));
     }
-    best.into_iter().map(|(k, (_, v))| (k, v)).collect()
+    lines
 }
 
-/// The session's own tabs (`tab name="…"` one level under `layout`), not those of the templates
-/// and swap layouts, which sit deeper. A tab without a name is `Tab #n`, as zellij calls it; the
-/// flag is the serializer's `focus=true` — the tab the session was on.
-pub fn tab_names(kdl: &str) -> Vec<(String, bool)> {
-    let mut depth = 0usize;
-    let mut names = Vec::new();
-    for raw in kdl.lines() {
-        let line = raw.trim();
-        let word = line
-            .split(|c: char| c.is_whitespace() || c == '{')
-            .next()
-            .unwrap_or("");
-        if word == "tab" && depth == 1 {
-            let name = line
-                .split("name=\"")
-                .nth(1)
-                .and_then(|rest| rest.split('"').next())
-                .map(str::to_string)
-                .unwrap_or_else(|| format!("Tab #{}", names.len() + 1));
-            names.push((name, line.contains("focus=true")));
-        }
-        depth += line.matches('{').count();
-        depth = depth.saturating_sub(line.matches('}').count());
-    }
-    names
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Node {
-    /// A node whose panes are not the session's (`new_tab_template`, swap layouts, …).
-    Ignored,
-    Tab,
-    Pane {
-        child_pane: bool,
-        plugin: bool,
-        claude: bool,
-    },
-    Other,
-}
-
-/// Tabs, terminal panes and `claude` panes in a serialized layout. A pane counts when it is a
-/// leaf (no child panes) and not a plugin (the bars); `floating_panes` count like the others.
-/// The serializer writes one node per line, which is all this reads.
-pub fn count_layout(kdl: &str) -> Saved {
-    let mut saved = Saved::default();
-    let mut stack: Vec<Node> = Vec::new();
-    for raw in kdl.lines() {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with("//") {
-            continue;
-        }
-        if line == "}" {
-            if let Some(Node::Pane {
-                child_pane: false,
-                plugin: false,
-                claude,
-            }) = stack.pop()
-            {
-                if counting(&stack) {
-                    saved.panes += 1;
-                    saved.agents += usize::from(claude);
-                }
-            }
-            continue;
-        }
-        let word = line
-            .split(|c: char| c.is_whitespace() || c == '{')
-            .next()
-            .unwrap_or("");
-        let opens = line.ends_with('{');
-        let ignored = stack.contains(&Node::Ignored);
-        match word {
-            "tab" if !ignored => {
-                saved.tabs += 1;
-            }
-            "pane" => {
-                if let Some(Node::Pane { child_pane, .. }) = stack.last_mut() {
-                    *child_pane = true;
-                }
-            }
-            "plugin" => {
-                if let Some(Node::Pane { plugin, .. }) = stack.last_mut() {
-                    *plugin = true;
-                }
-            }
-            _ => {}
-        }
-        let claude = word == "pane" && runs_claude(line);
-        if word == "pane" && !opens && counting(&stack) {
-            saved.panes += 1;
-            saved.agents += usize::from(claude);
-        }
-        if opens {
-            stack.push(match word {
-                "tab" if !ignored => Node::Tab,
-                "pane" => Node::Pane {
-                    child_pane: false,
-                    plugin: false,
-                    claude,
+/// zellij's attention per session, reduced to the one state the column shows: what needs a
+/// person first, then what failed, what finished, what works. Muted and idle sessions show none.
+pub fn attention(global: &GlobalAttention) -> BTreeMap<String, Attention> {
+    global
+        .sessions
+        .iter()
+        .filter(|s| !s.attention.muted)
+        .filter_map(|s| {
+            let c = &s.attention.counts;
+            let (symbol, word, count, tone) = match s.attention.status {
+                AttentionStatus::NeedsYou => ("●", "needs you", c.needs_you, Tone::Waiting),
+                AttentionStatus::Failed => ("✗", "failed", c.failed, Tone::Waiting),
+                AttentionStatus::Done => ("✓", "done", c.done, Tone::Done),
+                AttentionStatus::Working => ("◐", "working", c.working, Tone::Busy),
+                AttentionStatus::NewOutput => ("•", "new output", c.new_output, Tone::Muted),
+                AttentionStatus::Quiet | AttentionStatus::Idle => return None,
+            };
+            Some((
+                s.name.clone(),
+                Attention {
+                    symbol,
+                    word,
+                    count,
+                    tone,
                 },
-                "new_tab_template"
-                | "tab_template"
-                | "pane_template"
-                | "swap_tiled_layout"
-                | "swap_floating_layout"
-                | "default_tab_template" => Node::Ignored,
-                _ => Node::Other,
-            });
-        }
-    }
-    saved
+            ))
+        })
+        .collect()
 }
 
-fn counting(stack: &[Node]) -> bool {
-    stack.contains(&Node::Tab) && !stack.contains(&Node::Ignored)
-}
-
-fn runs_claude(line: &str) -> bool {
-    let Some(rest) = line.split("command=\"").nth(1) else {
-        return false;
-    };
-    let cmd = rest.split('"').next().unwrap_or("");
-    cmd.rsplit('/').next() == Some("claude")
+/// `claude --resume …`, `/usr/bin/claude` — a pane that comes back as an agent.
+fn runs_claude(command: &str) -> bool {
+    let program = command.split_whitespace().next().unwrap_or("");
+    program.rsplit('/').next() == Some("claude")
 }
 
 /// `5s`, `12m`, `3h`, `4d`, `2mo` — one unit, like a list wants it.
@@ -312,93 +243,88 @@ pub fn fit(s: &str, width: usize) -> String {
 mod tests {
     use super::*;
 
-    const SCHOOL: &str = r#"layout {
-    cwd "/mnt/storage/biserstoilov/school"
-    tab name="Tab #1" hide_floating_panes=true {
-        pane size=1 borderless=true {
-            plugin location="file:/x/lvim-zbar.wasm" {
-                bar "hints"
-            }
-        }
-        pane split_direction="vertical" {
-            pane command="claude" size="50%" {
-                args "--continue"
-                start_suspended true
-            }
-            pane contents_file="initial_contents_1" size="50%"
-        }
-        pane size=1 borderless=true {
-            plugin location="file:/x/lvim-zbar.wasm"
+    use zellij_tile::prelude::{SavedPanePreview, SavedTabPreview};
+
+    fn pane(command: Option<&str>, focused: bool) -> SavedPanePreview {
+        SavedPanePreview {
+            command: command.map(str::to_string),
+            focused,
+            ..Default::default()
         }
     }
-    tab name="Tab #2" hide_floating_panes=true {
-        pane size=1 borderless=true {
-            plugin location="file:/x/lvim-zbar.wasm" {
-                bar "hints"
-            }
-        }
-        pane contents_file="initial_contents_2"
-        floating_panes {
-            pane command="/usr/bin/claude" x=1 y=1
-        }
-        pane size=1 borderless=true {
-            plugin location="file:/x/lvim-zbar.wasm"
-        }
-    }
-    new_tab_template {
-        pane size=1 borderless=true {
-            plugin location="file:/x/lvim-zbar.wasm"
-        }
-        pane cwd="/mnt/storage/biserstoilov/school"
-    }
-    swap_tiled_layout name="vertical" {
-        tab max_panes=5 {
-            pane
-            pane
-        }
-    }
-}
-"#;
 
     #[test]
-    fn a_saved_layout_counts_its_tabs_its_terminal_panes_and_its_claude_panes() {
+    fn a_saved_session_counts_its_tabs_panes_and_the_claude_panes() {
+        let preview = SavedSessionPreview {
+            session_name: "SCHOOL".into(),
+            tabs: vec![
+                SavedTabPreview {
+                    name: "Tab #1".into(),
+                    focused: false,
+                    panes: vec![pane(Some("claude --continue"), true), pane(None, false)],
+                },
+                SavedTabPreview {
+                    name: "work".into(),
+                    focused: true,
+                    panes: vec![pane(Some("/usr/bin/claude"), false), pane(Some("claudette"), false)],
+                },
+            ],
+            ..Default::default()
+        };
         assert_eq!(
-            count_layout(SCHOOL),
+            saved_counts(&preview),
             Saved {
                 tabs: 2,
                 panes: 4,
                 agents: 2
             }
         );
-    }
-
-    #[test]
-    fn a_saved_layout_names_its_own_tabs_and_not_the_templates() {
-        let names =
-            |kdl: &str| -> Vec<String> { tab_names(kdl).into_iter().map(|(n, _)| n).collect() };
-        assert_eq!(names(SCHOOL), ["Tab #1", "Tab #2"]);
-        let kdl = "layout {\n    tab {\n    }\n    tab name=\"work\" focus=true {\n    }\n}\n";
         assert_eq!(
-            tab_names(kdl),
+            saved_tabs(&preview),
             [("Tab #1".to_string(), false), ("work".to_string(), true)]
         );
     }
 
     #[test]
-    fn the_dump_keeps_the_newer_layout_of_a_name_saved_twice() {
-        let dump = "\x1eSCHOOL\t100\nlayout {\n    tab {\n        pane\n    }\n}\n\
-                    \x1eSCHOOL\t200\nlayout {\n    tab {\n        pane\n        pane\n    }\n    tab {\n        pane\n    }\n}\n\
-                    \x1eGO\t5\nlayout {\n}\n";
-        let saved = parse_saved(dump);
-        assert_eq!(
-            saved["SCHOOL"],
-            Saved {
-                tabs: 2,
-                panes: 3,
-                agents: 0
-            }
-        );
-        assert_eq!(saved["GO"], Saved::default());
+    fn zellij_attention_shows_the_state_that_needs_a_person_first() {
+        use zellij_tile::prelude::{AttentionCounts, GlobalSessionAttention, SessionAttention};
+        let session = |name: &str, status, muted, counts| GlobalSessionAttention {
+            name: name.into(),
+            is_current: false,
+            attention: SessionAttention {
+                status,
+                counts,
+                muted,
+                top: None,
+                items: vec![],
+            },
+        };
+        let global = GlobalAttention {
+            sessions: vec![
+                session("A", AttentionStatus::NeedsYou, false, AttentionCounts { needs_you: 2, ..Default::default() }),
+                session("B", AttentionStatus::Working, true, AttentionCounts::default()),
+                session("C", AttentionStatus::Idle, false, AttentionCounts::default()),
+            ],
+            ..Default::default()
+        };
+        let shown = attention(&global);
+        assert_eq!(shown.len(), 1);
+        assert_eq!(shown["A"].word, "needs you");
+        assert_eq!(shown["A"].count, 2);
+    }
+
+    #[test]
+    fn a_saved_tab_lists_its_panes_and_marks_the_chosen_one() {
+        let tab = SavedTabPreview {
+            name: "t".into(),
+            focused: true,
+            panes: vec![
+                SavedPanePreview { command: Some("nvim".into()), cwd: Some("/p".into()), ..Default::default() },
+                SavedPanePreview { contents: Some("last line".into()), ..Default::default() },
+            ],
+        };
+        assert_eq!(saved_tab_lines(&tab, 0), ["▸ $ nvim   /p", "  shell"]);
+        assert_eq!(saved_tab_lines(&tab, 1), ["  $ nvim   /p", "▸ shell", "", "last line"]);
     }
 
     #[test]

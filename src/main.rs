@@ -39,7 +39,7 @@ const DEFAULT_SHELL: &str = "zsh";
 mod panel;
 mod ui;
 
-use panel::{Agents, Kind, Row, Saved};
+use panel::{Agents, Kind, Row};
 
 #[derive(Default)]
 struct State {
@@ -64,16 +64,22 @@ impl ZellijPlugin for State {
             request_permission(&[
                 PermissionType::ReadApplicationState, // SessionUpdate, SaveSession
                 PermissionType::ChangeApplicationState, // switch, rename, kill, delete
-                PermissionType::RunCommands,          // the saved layouts
+                // Not used by the panel, but the background instance needs it and zellij keeps
+                // one cached set per URL: both instances ask for the same set.
+                PermissionType::RunCommands,
                 PermissionType::MessageAndLaunchOtherPlugins, // ask lvim-zclaude, notice
                 PermissionType::ReadCliPipes,         // lvim-zclaude answers with `zellij pipe`
+                PermissionType::ReadPaneContents,     // the preview of a session's pane
             ]);
             subscribe(&[
                 EventType::SessionUpdate,
                 EventType::Key,
-                EventType::RunCommandResult,
                 EventType::PermissionRequestResult,
                 EventType::ModeUpdate,
+                EventType::SessionPreview,
+                EventType::SavedSessionPreview,
+                EventType::GlobalAttentionUpdate,
+                EventType::Timer,
             ]);
             return;
         }
@@ -88,6 +94,9 @@ impl ZellijPlugin for State {
             // zellij 0.46: the denial names it; the shim then panics on the empty response).
             PermissionType::RunCommands,
             PermissionType::MessageAndLaunchOtherPlugins, // the "notice" broadcast
+            // The panel's two (same URL, one cached set — see the panel's request).
+            PermissionType::ReadCliPipes,
+            PermissionType::ReadPaneContents,
         ]);
         subscribe(&[EventType::PaneUpdate, EventType::CommandPaneExited]);
     }
@@ -154,6 +163,11 @@ impl ZellijPlugin for State {
         if message.name == "restart" {
             restart();
         }
+        // lvim-zclaude's board asks for the session panel: this instance launches it (or focuses
+        // it), with the same configuration the `Ctrl s s` bind gives it.
+        if message.name == "lvim-zsession-open" {
+            open_panel();
+        }
         false
     }
 
@@ -189,11 +203,16 @@ const SIZE: [(&str, &str); 4] = [
 struct Panel {
     live: Vec<SessionInfo>,
     dead: Vec<(String, Duration)>,
-    saved: BTreeMap<String, Saved>,
-    /// The tab names of each saved layout.
-    saved_tabs: BTreeMap<String, Vec<(String, bool)>>,
+    /// What zellij read from each saved session's layout (`get_saved_session_preview`).
+    saved: BTreeMap<String, SavedSessionPreview>,
     /// The tab chosen with ←/→ in the detail line — Enter lands there. Cleared when the row changes.
     tab: Option<usize>,
+    /// The pane of that tab chosen with Shift ←/→ (an index into the preview's panes).
+    pane: Option<usize>,
+    /// The selected live session's chosen tab, as zellij last sent it.
+    preview: Option<SessionPreview>,
+    /// zellij's attention, per live session.
+    attention: BTreeMap<String, ui::Attention>,
     agents: BTreeMap<String, Agents>,
     /// The resurrectable names the saved layouts were last read for.
     saved_for: Vec<String>,
@@ -236,16 +255,35 @@ impl Panel {
                 self.take(live, dead);
                 true
             }
-            Event::RunCommandResult(_, stdout, _, ctx) => {
-                if ctx.get("step").map(String::as_str) != Some("saved") {
-                    return false;
+            Event::SessionPreview(preview) => {
+                let wanted = matches!(self.current_item(), Some(ui::Item::Session(row)) if row.name == preview.session_name);
+                if wanted {
+                    self.preview = Some(preview);
                 }
-                let out = String::from_utf8_lossy(&stdout);
-                self.saved = panel::parse_saved(&out);
-                self.saved_tabs = panel::parse_saved_tabs(&out);
+                wanted
+            }
+            Event::SavedSessionPreview(preview) => {
+                self.saved.insert(preview.session_name.clone(), preview);
                 true
             }
-            Event::Key(key) => self.key(key),
+            Event::GlobalAttentionUpdate(global) => {
+                let attention = panel::attention(&global);
+                let changed = attention != self.attention;
+                self.attention = attention;
+                changed
+            }
+            // The preview of a live session follows what its pane does: asked again each second
+            // while the panel is open.
+            Event::Timer(_) => {
+                self.ask_preview();
+                set_timeout(1.0);
+                false
+            }
+            Event::Key(key) => {
+                let changed = self.key(key);
+                self.ask_preview();
+                changed
+            }
             _ => false,
         }
     }
@@ -267,9 +305,11 @@ impl Panel {
             change_floating_panes_coordinates(vec![(PaneId::Plugin(own), coordinates)]);
         }
         pipe_message_to_plugin(MessageToPlugin::new("lvim-zclaude-summary-request"));
+        set_timeout(1.0);
         match get_session_list() {
             Ok(snapshot) => {
                 self.take(snapshot.live_sessions, snapshot.resurrectable_sessions);
+                self.ask_preview();
                 true
             }
             Err(e) => {
@@ -289,11 +329,11 @@ impl Panel {
         let mut names: Vec<String> = dead.iter().map(|(n, _)| n.clone()).collect();
         names.sort();
         if names != self.saved_for {
+            // zellij reads each saved layout and answers with `SavedSessionPreview`, one by one.
+            for name in names.iter().filter(|n| !self.saved.contains_key(*n)) {
+                get_saved_session_preview(name);
+            }
             self.saved_for = names;
-            run_command(
-                &["sh", "-c", panel::SAVED_SCRIPT],
-                BTreeMap::from([("step".to_string(), "saved".to_string())]),
-            );
         }
         self.live = live;
         self.dead = dead;
@@ -322,7 +362,7 @@ impl Panel {
                 name: name.clone(),
                 kind: Kind::Dead {
                     age: *age,
-                    saved: self.saved.get(name).copied(),
+                    saved: self.saved.get(name).map(panel::saved_counts),
                 },
             }))
             .collect();
@@ -377,10 +417,13 @@ impl Panel {
             Mode::List => {}
         }
         let count = self.items().len();
-        let before = (self.selected, self.filter.clone());
+        let before = (self.selected, self.filter.clone(), self.tab);
         let handled = self.list_key(&key, count);
-        if (self.selected, self.filter.clone()) != before {
+        if (self.selected, self.filter.clone()) != (before.0, before.1) {
             self.tab = None;
+            self.pane = None;
+        } else if self.tab != before.2 {
+            self.pane = None;
         }
         handled
     }
@@ -388,6 +431,22 @@ impl Panel {
     fn list_key(&mut self, key: &KeyWithModifier, count: usize) -> bool {
         let ctrl = |b: BareKey| key.is_key_with_ctrl_modifier(b);
         let bare = |b: BareKey| key.is_key_without_modifier(b);
+        let shift = |b: BareKey| key.is_key_with_shift_modifier(b);
+        if shift(BareKey::Left) || shift(BareKey::Right) {
+            let panes = self.panes_of_tab();
+            if !panes.is_empty() {
+                let n = panes.len();
+                let from = self
+                    .pane
+                    .unwrap_or_else(|| panes.iter().position(|(_, f)| *f).unwrap_or(0));
+                self.pane = Some(if shift(BareKey::Right) {
+                    (from + 1) % n
+                } else {
+                    (from + n - 1) % n
+                });
+            }
+            return true;
+        }
         if bare(BareKey::Left) || bare(BareKey::Right) {
             let tabs = self.tabs_of_current();
             if !tabs.is_empty() {
@@ -448,6 +507,16 @@ impl Panel {
                 Err(e) => format!("save FAILED: {e}"),
             });
             notice(self.message.as_deref().unwrap_or(""));
+        } else if ctrl(BareKey::Char('o')) {
+            // The agents of the selected session, on lvim-zclaude's board.
+            let session = match self.current_item() {
+                Some(ui::Item::Session(row)) => row.name,
+                _ => String::new(),
+            };
+            pipe_message_to_plugin(
+                MessageToPlugin::new("lvim-zclaude-open").with_payload(format!("session={session}")),
+            );
+            close_self();
         } else if ctrl(BareKey::Char('x')) {
             disconnect_other_clients();
             self.message = Some("other clients disconnected".to_string());
@@ -481,7 +550,8 @@ impl Panel {
         let Some(ui::Item::Session(row)) = self.current_item() else {
             return Vec::new();
         };
-        let saved = self.saved_tabs.get(&row.name);
+        let saved_tabs = self.saved.get(&row.name).map(panel::saved_tabs);
+        let saved = saved_tabs.as_ref();
         let mut tabs: Vec<(String, bool)> = match self.live.iter().find(|s| s.name == row.name) {
             Some(info) => {
                 let mut tabs: Vec<&TabInfo> = info.tabs.iter().collect();
@@ -548,6 +618,19 @@ impl Panel {
                 if let Some(tab) = self.tab {
                     switch_tab_to(tab as u32 + 1);
                 }
+                if let Some((id, is_plugin)) = self.chosen_pane() {
+                    let pane = if is_plugin { PaneId::Plugin(id) } else { PaneId::Terminal(id) };
+                    focus_session_pane(&row.name, pane);
+                }
+            }
+            Some(ui::Item::Session(row)) if row.is_live() && self.chosen_pane().is_some() => {
+                // Straight onto the pane chosen with Shift ←/→: zellij finds its tab.
+                switch_session_with_options(ConnectToSession {
+                    name: Some(row.name.clone()),
+                    pane_id: self.chosen_pane(),
+                    ..Default::default()
+                });
+                close_self();
             }
             Some(ui::Item::Session(row)) => {
                 // A resurrectable name is brought back by the same calls.
@@ -597,6 +680,142 @@ impl Panel {
         }
     }
 
+    /// The selected live session's chosen tab, asked of zellij again. The answer comes as
+    /// `SessionPreview`; a saved session's was asked once, with the list.
+    fn ask_preview(&mut self) {
+        let Some(ui::Item::Session(row)) = self.current_item() else {
+            self.preview = None;
+            return;
+        };
+        if self.preview.as_ref().is_some_and(|p| p.session_name != row.name) {
+            self.preview = None;
+        }
+        if !row.is_live() {
+            if !self.saved.contains_key(&row.name) {
+                get_saved_session_preview(&row.name);
+            }
+            return;
+        }
+        let tab = self.tab.or_else(|| self.tabs_of_current().iter().position(|(_, a)| *a));
+        // Unless a pane was chosen: the tab's focused *terminal*. zellij's own choice is the
+        // focused pane, and in this session that is the panel itself (or lvim-zclaude's board).
+        let pane = self
+            .chosen_pane()
+            .or_else(|| tab.and_then(|t| self.pane_in_tab(&row.name, t)).map(|id| (id, false)));
+        get_session_preview(&row.name, tab, pane);
+    }
+
+    /// The panes of the chosen tab, from the preview: `(title, focused)`.
+    fn panes_of_tab(&self) -> Vec<(String, bool)> {
+        let Some(ui::Item::Session(row)) = self.current_item() else {
+            return Vec::new();
+        };
+        let tab = self.tab.or_else(|| self.tabs_of_current().iter().position(|(_, a)| *a));
+        if row.is_live() {
+            let Some(preview) = self.preview.as_ref().filter(|p| p.session_name == row.name) else {
+                return Vec::new();
+            };
+            let tab = tab.or(preview.active_tab_index).unwrap_or(0);
+            // "Focused" here is the pane the preview shows — the one zellij answered for.
+            let shown = preview.pane_id;
+            preview
+                .tabs
+                .get(tab)
+                .map(|t| {
+                    t.panes
+                        .iter()
+                        .filter(|p| !p.is_plugin)
+                        .map(|p| (p.title.clone(), shown.map_or(p.focused, |s| s == (p.id, p.is_plugin))))
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            let Some(saved) = self.saved.get(&row.name) else {
+                return Vec::new();
+            };
+            let tab = tab.unwrap_or(0);
+            saved
+                .tabs
+                .get(tab)
+                .map(|t| {
+                    t.panes
+                        .iter()
+                        .map(|p| (panel::saved_pane_title(p), p.focused))
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+    }
+
+    /// The live pane chosen with Shift ←/→, as zellij names it: `(id, is_plugin)`.
+    fn chosen_pane(&self) -> Option<(u32, bool)> {
+        let index = self.pane?;
+        let Some(ui::Item::Session(row)) = self.current_item() else {
+            return None;
+        };
+        let preview = self.preview.as_ref().filter(|p| p.session_name == row.name)?;
+        let tab = self
+            .tab
+            .or_else(|| self.tabs_of_current().iter().position(|(_, a)| *a))
+            .or(preview.active_tab_index)
+            .unwrap_or(0);
+        let pane = preview.tabs.get(tab)?.panes.iter().filter(|p| !p.is_plugin).nth(index)?;
+        Some((pane.id, pane.is_plugin))
+    }
+
+    /// What goes under the tabs line: the chosen tab's pane, live; or what a saved tab brings back.
+    fn preview_view(&self) -> Option<ui::Preview> {
+        let Some(ui::Item::Session(row)) = self.current_item() else {
+            return None;
+        };
+        let panes = self.panes_of_tab();
+        let chosen = self.pane.or_else(|| panes.iter().position(|(_, f)| *f)).unwrap_or(0);
+        let count = if panes.len() > 1 {
+            format!("  ({}/{} · Shift ←→)", chosen + 1, panes.len())
+        } else {
+            String::new()
+        };
+        if row.is_live() {
+            let preview = self.preview.as_ref().filter(|p| p.session_name == row.name)?;
+            if let Some(error) = &preview.error {
+                return Some(ui::Preview {
+                    title: "preview".to_string(),
+                    lines: vec![error.clone()],
+                });
+            }
+            let tab = preview
+                .tab_index
+                .and_then(|t| preview.tab_names.get(t))
+                .cloned()
+                .unwrap_or_default();
+            let pane = panes.get(chosen).map(|(t, _)| t.clone()).unwrap_or_default();
+            return Some(ui::Preview {
+                title: format!("{tab} › {pane}{count}"),
+                lines: preview.contents.lines().map(str::to_string).collect(),
+            });
+        }
+        let saved = self.saved.get(&row.name)?;
+        if let Some(error) = &saved.error {
+            return Some(ui::Preview {
+                title: "saved layout".to_string(),
+                lines: vec![error.clone()],
+            });
+        }
+        let tab_index = self
+            .tab
+            .or_else(|| saved.tabs.iter().position(|t| t.focused))
+            .unwrap_or(0);
+        let tab = saved.tabs.get(tab_index)?;
+        Some(ui::Preview {
+            title: format!(
+                "{} · saved{}{count}",
+                tab.name,
+                saved.folder.as_deref().map(|f| format!(" · {f}")).unwrap_or_default()
+            ),
+            lines: panel::saved_tab_lines(tab, chosen),
+        })
+    }
+
     /// What the selected row holds that the columns do not: a live session's tabs, a saved one's
     /// age and what comes back, the new-session row's name.
     /// The line under the list: the selected session and its tabs (←/→ chooses one), or what
@@ -635,6 +854,7 @@ impl Panel {
             Mode::New(buf) => Some(("new session name (empty = zellij picks): ", buf.as_str())),
             _ => None,
         };
+        let preview = self.preview_view();
         let view = ui::View {
             items: &items,
             cursor,
@@ -651,6 +871,8 @@ impl Panel {
             } else {
                 self.message.as_deref()
             },
+            preview: preview.as_ref(),
+            attention: &self.attention,
         };
         ui::draw(&view, rows, cols);
     }
@@ -672,6 +894,7 @@ impl State {
             path: self.shell.clone().into(),
             args: Vec::new(),
             cwd: None, // inherit the replaced pane's directory (filled in by zellij)
+            ..Default::default()
         };
         match open_command_pane_in_place_of_pane_id(
             PaneId::Terminal(pane_id),
@@ -745,6 +968,18 @@ fn restart() {
     run_command(
         &["sh", "-c", RESTART_SCRIPT, "lvim-zsession", &name],
         BTreeMap::new(),
+    );
+}
+
+/// The session panel, launched by the background instance the way `Ctrl s s` launches it — the
+/// same URL (`zellij:OWN_URL`) and configuration, so an open panel is focused, not doubled.
+fn open_panel() {
+    pipe_message_to_plugin(
+        MessageToPlugin::new("open")
+            .with_plugin_url("zellij:OWN_URL")
+            .with_plugin_config(BTreeMap::from([("panel".to_string(), "on".to_string())]))
+            .new_plugin_instance_should_float(true)
+            .new_plugin_instance_should_have_pane_title("sessions"),
     );
 }
 
