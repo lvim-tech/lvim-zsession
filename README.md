@@ -52,8 +52,8 @@ Keys: type to filter (letters in order), `↑`/`↓` (`Tab`, `Ctrl j`/`Ctrl k`),
 resurrect, `Ctrl n` new session (asks for a name; empty lets zellij pick one) — or `Enter` on the
 last row, `+ new session «what you typed»`, `Del` kill a live session / delete a saved one (asks
 once more), `Ctrl r` rename this session, `Ctrl a` save this session to disk now, `Ctrl x`
-disconnect other clients, `Ctrl o` lvim-zclaude's board filtered to the selected session's agents
-(its own `Ctrl o` comes back here), `Esc` close.
+disconnect other clients, `Ctrl o` lvim-zclaude's board, the cursor on the selected session's
+agents (its own `Ctrl o` comes back here), `Esc` close.
 
 Needs zellij built from `main` at or after `644d78c` (2026-11-10): the preview, the saved layouts,
 the attention and `switch_session_with_options` are not in a released zellij yet.
