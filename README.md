@@ -56,7 +56,7 @@ disconnect other clients, `Ctrl o` lvim-zclaude's board, the cursor on the selec
 agents (its own `Ctrl o` comes back here), `Esc` close.
 
 The keys work with another keyboard layout on: `Ctrl д` is read as `Ctrl o` (and `щ` as `y` in
-the confirmation), by the tables of [lvim-zlayout](../lvim-zlayout) — `layouts "bg-bds"` in the
+the confirmation), by the tables of [lvim-zlayout](https://github.com/lvim-tech/lvim-zlayout) — `layouts "bg-bds"` in the
 configuration (the default; several separated by commas, `none` turns it off). Typed text — the
 filter, a session name — stays as typed.
 
