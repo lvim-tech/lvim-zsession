@@ -55,6 +55,11 @@ once more), `Ctrl r` rename this session, `Ctrl a` save this session to disk now
 disconnect other clients, `Ctrl o` lvim-zclaude's board, the cursor on the selected session's
 agents (its own `Ctrl o` comes back here), `Esc` close.
 
+The keys work with another keyboard layout on: `Ctrl д` is read as `Ctrl o` (and `щ` as `y` in
+the confirmation), by the tables of [lvim-zlayout](../lvim-zlayout) — `layouts "bg-bds"` in the
+configuration (the default; several separated by commas, `none` turns it off). Typed text — the
+filter, a session name — stays as typed.
+
 Needs zellij built from `main` at or after `644d78c` (2026-11-10): the preview, the saved layouts,
 the attention and `switch_session_with_options` are not in a released zellij yet.
 

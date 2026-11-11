@@ -1161,9 +1161,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "lvim-zlayout"
+version = "0.1.0"
+
+[[package]]
 name = "lvim-zsession"
 version = "0.5.0"
 dependencies = [
+ "lvim-zlayout",
  "zellij-tile",
 ]
 

@@ -36,6 +36,7 @@ use zellij_tile::prelude::*;
 // the serializer keeps treating our replacement shells as plain panes.
 const DEFAULT_SHELL: &str = "zsh";
 
+mod layout;
 mod panel;
 mod ui;
 
@@ -54,8 +55,15 @@ struct State {
 
 // Host tests cannot link the plugin's exports (they import zellij's host functions), so the
 // registration is left out of the test build and the panel's pure parts are tested alone.
+// The exports are in `host.rs` (the `register_plugin!` macro written out, so a key keeps its whole
+// character).
 #[cfg(not(test))]
-register_plugin!(State);
+mod host;
+
+#[cfg(not(test))]
+fn main() {
+    host::main();
+}
 
 impl ZellijPlugin for State {
     fn load(&mut self, configuration: BTreeMap<String, String>) {
@@ -224,6 +232,8 @@ struct Panel {
     palette: Option<ui::Palette>,
     /// x, y, width, height — from the configuration, or `SIZE`.
     geometry: [String; 4],
+    /// The keyboard layouts whose letters are read as the Latin keys (`layouts`, `layout.rs`).
+    layouts: layout::Layouts,
 }
 
 impl Panel {
@@ -237,6 +247,7 @@ impl Panel {
         };
         Panel {
             geometry: SIZE.map(get),
+            layouts: layout::Layouts::from_config(configuration.get("layouts").map(String::as_str)),
             ..Panel::default()
         }
     }
@@ -396,6 +407,9 @@ impl Panel {
     }
 
     fn key(&mut self, key: KeyWithModifier) -> bool {
+        // `Ctrl д` is `Ctrl o` with the Bulgarian layout on (`layout.rs`); bare letters stay as
+        // typed — here they are text (the filter, a session name).
+        let key = layout::modified_to_latin(&self.layouts, key);
         let bare = |b: BareKey| key.is_key_without_modifier(b);
         match std::mem::take(&mut self.mode) {
             Mode::Rename(buf) => {
@@ -407,7 +421,8 @@ impl Panel {
                 return true;
             }
             Mode::Confirm(name) => {
-                if bare(BareKey::Delete) || bare(BareKey::Char('y')) {
+                let latin = layout::plain_to_latin(&self.layouts, &key);
+                if bare(BareKey::Delete) || latin.is_key_without_modifier(BareKey::Char('y')) {
                     self.remove(&name);
                 } else {
                     self.message = None;
