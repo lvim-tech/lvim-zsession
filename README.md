@@ -44,11 +44,12 @@ It is drawn like lvim-zclaude's board — the same size (80%×70%, `x`/`y`/`widt
 configuration change it), colours taken only from the active zellij theme, columns ST · SESSION ·
 TABS · PANES · CLIENTS · AGENTS · ATTENTION · LAST under a RUNNING and a SAVED heading, a detail
 line for the selected row, the preview, and zellij's `Help:` line at the foot (wrapped onto as
-many lines as it needs). The detail line shows the selected session's tabs (a saved session's from
-its layout) in the theme's yellow: `←`/`→` choose one, `Shift ←`/`Shift →` choose a pane of it, and
-`Enter` goes to the session with that tab — or that pane — focused (in this session: just there).
+many lines as it needs). Under the list the selected session reads SESSION › TAB › PANE: its tabs
+(a saved session's from its layout) on one line in the theme's yellow, `←`/`→` choosing one, and the
+chosen tab's panes on the line under it, `Tab`/`Shift Tab` choosing one. `Enter` goes to the
+session with that tab — or that pane — focused (in this session: just there).
 
-Keys: type to filter (letters in order), `↑`/`↓` (`Tab`, `Ctrl j`/`Ctrl k`), `Enter` open or
+Keys: type to filter (letters in order), `↑`/`↓` (`Ctrl j`/`Ctrl k`), `Enter` open or
 resurrect, `Ctrl n` new session (asks for a name; empty lets zellij pick one) — or `Enter` on the
 last row, `+ new session «what you typed»`, `Del` kill a live session / delete a saved one (asks
 once more), `Ctrl r` rename this session, `Ctrl a` save this session to disk now, `Ctrl x`

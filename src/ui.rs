@@ -84,10 +84,14 @@ pub enum Item {
 /// The line under the list: the selected session and its tabs, one of them chosen with ←/→ —
 /// or, for the new-session row, what Enter will do.
 pub enum Detail {
+    /// SESSION › TAB › PANE: the session, its tabs (the chosen one marked), and on the line under
+    /// them the chosen tab's panes (the chosen one marked).
     Tabs {
         name: String,
         tabs: Vec<String>,
         chosen: Option<usize>,
+        panes: Vec<String>,
+        pane: Option<usize>,
     },
     Text(String),
 }
@@ -219,10 +223,10 @@ pub fn draw(view: &View, rows: usize, cols: usize) {
         lines.push(Line::Item(i, item));
     }
 
-    // Title, headings, detail and message/input are four lines that are always there; the help
-    // is as many as it wraps to at this width. What is left is the list's and the preview's: the
-    // list takes what it needs up to three fifths, the preview the rest.
-    let room = rows.saturating_sub(4 + help_height(view, cols)).max(1);
+    // Title, headings, the tabs line, the panes line and message/input are five lines that are
+    // always there; the help is as many as it wraps to at this width. What is left is the list's
+    // and the preview's: the list takes what it needs up to three fifths, the preview the rest.
+    let room = rows.saturating_sub(5 + help_height(view, cols)).max(1);
     let needed = lines.len().max(1);
     let (body, preview_rows) = if view.preview.is_some() && room >= 10 {
         let list = needed.min(room - room * 2 / 5).max(3);
@@ -273,6 +277,7 @@ pub fn draw(view: &View, rows: usize, cols: usize) {
     }
 
     println!("{}", detail_line(view, cols));
+    println!("{}", panes_line(view, cols));
     if let Some(preview) = view.preview.filter(|_| preview_rows > 0) {
         draw_preview(view, preview, preview_rows, cols);
     }
@@ -292,7 +297,7 @@ fn draw_preview(view: &View, preview: &Preview, rows: usize, cols: usize) {
         fg(pal.map(|p| p.muted), &rule)
     );
     let body = rows.saturating_sub(1);
-    let lines = trim_blank_tail(&preview.lines);
+    let lines = compact(trim_blank_tail(&preview.lines));
     let start = lines.len().saturating_sub(body);
     let mut drawn = 0;
     for line in &lines[start..] {
@@ -311,6 +316,31 @@ fn trim_blank_tail(lines: &[String]) -> &[String] {
         .rposition(|l| !strip_ansi(l).trim().is_empty())
         .map_or(0, |i| i + 1);
     &lines[..end]
+}
+
+/// The screen with every run of hollow rows (spaces and frame lines only, `│        │`) cut to
+/// one. A full-screen program (secmon's TUI, htop) fills its pane: its tabs and data at the top,
+/// a key line at the bottom, and between them rows of empty frame. The preview shows the bottom
+/// of the screen — right for a shell, where the latest output is — and of such a program it
+/// showed the empty frame only. Without the hollow runs the top and the bottom fit together.
+fn compact(lines: &[String]) -> Vec<&String> {
+    let mut out: Vec<&String> = Vec::with_capacity(lines.len());
+    let mut previous_hollow = false;
+    for line in lines {
+        let hollow = is_hollow(line);
+        if !(hollow && previous_hollow) {
+            out.push(line);
+        }
+        previous_hollow = hollow;
+    }
+    out
+}
+
+/// Nothing on the row but spaces and box-drawing characters (U+2500–U+257F).
+fn is_hollow(line: &str) -> bool {
+    strip_ansi(line)
+        .chars()
+        .all(|c| c.is_whitespace() || ('\u{2500}'..='\u{257f}').contains(&c))
 }
 
 /// Cut a **styled** line to `width` visible characters: the escapes are copied and not counted,
@@ -412,34 +442,77 @@ fn detail_line(view: &View, cols: usize) -> String {
     let yellow = pal.map(|p| p.name);
     match &view.detail {
         Detail::Text(text) => fg(yellow, &panel::fit(&format!("  {text}"), cols)),
-        Detail::Tabs { name, tabs, chosen } => {
-            let mut out = format!("  {BOLD}{}{UNBOLD}  ", fg(yellow, &panel::fit(name, 32)));
-            let mut used = 4 + name.chars().count().min(32);
-            for (i, tab) in tabs.iter().enumerate() {
-                let cell = format!(" {} ", panel::fit(tab, 24));
-                let width = cell.chars().count() + 1;
-                if used + width > cols && chosen.is_none_or(|c| c < i) {
-                    out.push_str(&fg(pal.map(|p| p.muted), "…"));
-                    break;
-                }
-                used += width;
-                if Some(i) == *chosen {
-                    match pal {
-                        Some(p) => out.push_str(&format!(
-                            "{}{BOLD}{}{UNBOLD}{RESET_BG}",
-                            ansi(p.selected, 48),
-                            fg(yellow, &cell)
-                        )),
-                        None => out.push_str(&format!("\u{1b}[7m{cell}\u{1b}[27m")),
-                    }
-                } else {
-                    out.push_str(&fg(yellow, &cell));
-                }
-                out.push(' ');
-            }
-            out
+        Detail::Tabs { name, tabs, chosen, .. } => {
+            let out = format!("  {BOLD}{}{UNBOLD}  ", fg(yellow, &panel::fit(name, 32)));
+            let used = 4 + name.chars().count().min(32);
+            out + &chips(pal, yellow, tabs, *chosen, Chosen::Background, used, cols)
         }
     }
+}
+
+/// `       › nvim  zsh  claude` — the chosen tab's panes, under the tabs and in the theme's blue;
+/// the chosen one only in another colour (bold, the accent of the keys), no background — the
+/// selection background is the tab's. Empty while there are none to show (a new-session row, a
+/// live tab whose preview has not come yet).
+fn panes_line(view: &View, cols: usize) -> String {
+    let Detail::Tabs { name, panes, pane, .. } = &view.detail else { return String::new() };
+    if panes.is_empty() {
+        return String::new();
+    }
+    let pal = view.palette;
+    let indent = 4 + name.chars().count().min(32);
+    let lead = format!("{}› ", " ".repeat(indent.saturating_sub(2)));
+    let out = fg(pal.map(|p| p.muted), &lead);
+    let chosen = Chosen::Colour(pal.map(|p| p.key));
+    out + &chips(pal, pal.map(|p| p.live), panes, *pane, chosen, indent, cols)
+}
+
+/// How the chosen name stands out: on the selection background (a tab), or in its own colour (a
+/// pane).
+#[derive(Clone, Copy)]
+enum Chosen {
+    Background,
+    Colour(Option<PaletteColor>),
+}
+
+/// Names side by side, ` name ` each, the chosen one marked as `how` says. Names that do not fit
+/// are left out from the end, never the chosen one.
+fn chips(
+    pal: Option<Palette>,
+    colour: Option<PaletteColor>,
+    names: &[String],
+    chosen: Option<usize>,
+    how: Chosen,
+    mut used: usize,
+    cols: usize,
+) -> String {
+    let mut out = String::new();
+    for (i, name) in names.iter().enumerate() {
+        let cell = format!(" {} ", panel::fit(name, 24));
+        let width = cell.chars().count() + 1;
+        if used + width > cols && chosen.is_none_or(|c| c < i) {
+            out.push_str(&fg(pal.map(|p| p.muted), "…"));
+            break;
+        }
+        used += width;
+        if Some(i) == chosen {
+            match (how, pal) {
+                (Chosen::Colour(accent), Some(_)) => {
+                    out.push_str(&format!("{BOLD}{}{UNBOLD}", fg(accent, &cell)))
+                }
+                (Chosen::Background, Some(p)) => out.push_str(&format!(
+                    "{}{BOLD}{}{UNBOLD}{RESET_BG}",
+                    ansi(p.selected, 48),
+                    fg(colour, &cell)
+                )),
+                (_, None) => out.push_str(&format!("\u{1b}[7m{cell}\u{1b}[27m")),
+            }
+        } else {
+            out.push_str(&fg(colour, &cell));
+        }
+        out.push(' ');
+    }
+    out
 }
 
 type Widths = (usize, usize, usize, usize, usize, usize, usize, usize);
@@ -623,7 +696,7 @@ fn help_keys(view: &View) -> &'static [(&'static str, &'static str)] {
             ("↑↓", "move"),
             ("Enter", "open"),
             ("←→", "tab"),
-            ("Shift ←→", "pane"),
+            ("Tab", "pane"),
             ("Ctrl o", "agents"),
             ("Ctrl n", "new"),
             ("Del", "kill/delete"),
@@ -716,5 +789,22 @@ mod tests {
     fn the_blank_rows_under_a_prompt_are_not_previewed() {
         let lines: Vec<String> = ["$ ls", "a b", "", "\u{1b}[0m  "].map(String::from).to_vec();
         assert_eq!(trim_blank_tail(&lines).len(), 2);
+    }
+
+    #[test]
+    fn the_empty_frame_of_a_full_screen_program_is_cut_to_one_row() {
+        let lines: Vec<String> = [
+            "┌ Alerts ─┐",
+            "│ 21s ago │",
+            "│         │",
+            "\u{1b}[2m│         │\u{1b}[0m",
+            "│         │",
+            "└─────────┘",
+            "[q] quit",
+        ]
+        .map(String::from)
+        .to_vec();
+        let shown: Vec<&str> = compact(&lines).into_iter().map(String::as_str).collect();
+        assert_eq!(shown, ["┌ Alerts ─┐", "│ 21s ago │", "│         │", "[q] quit"]);
     }
 }

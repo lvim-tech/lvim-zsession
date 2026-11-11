@@ -221,7 +221,7 @@ struct Panel {
     saved: BTreeMap<String, SavedSessionPreview>,
     /// The tab chosen with ←/→ in the detail line — Enter lands there. Cleared when the row changes.
     tab: Option<usize>,
-    /// The pane of that tab chosen with Shift ←/→ (an index into the preview's panes).
+    /// The pane of that tab chosen with Tab / Shift Tab (an index into the preview's panes).
     pane: Option<usize>,
     /// The selected live session's chosen tab, as zellij last sent it.
     preview: Option<SessionPreview>,
@@ -453,14 +453,15 @@ impl Panel {
         let ctrl = |b: BareKey| key.is_key_with_ctrl_modifier(b);
         let bare = |b: BareKey| key.is_key_without_modifier(b);
         let shift = |b: BareKey| key.is_key_with_shift_modifier(b);
-        if shift(BareKey::Left) || shift(BareKey::Right) {
+        // Tab / Shift Tab: the next / previous pane of the chosen tab.
+        if bare(BareKey::Tab) || shift(BareKey::Tab) {
             let panes = self.panes_of_tab();
             if !panes.is_empty() {
                 let n = panes.len();
                 let from = self
                     .pane
                     .unwrap_or_else(|| panes.iter().position(|(_, f)| *f).unwrap_or(0));
-                self.pane = Some(if shift(BareKey::Right) {
+                self.pane = Some(if bare(BareKey::Tab) {
                     (from + 1) % n
                 } else {
                     (from + n - 1) % n
@@ -489,7 +490,7 @@ impl Panel {
         }
         if bare(BareKey::Esc) || ctrl(BareKey::Char('c')) {
             close_self();
-        } else if bare(BareKey::Down) || bare(BareKey::Tab) || ctrl(BareKey::Char('j')) {
+        } else if bare(BareKey::Down) || ctrl(BareKey::Char('j')) {
             if count > 0 {
                 self.selected = (self.selected + 1) % count;
             }
@@ -645,7 +646,7 @@ impl Panel {
                 }
             }
             Some(ui::Item::Session(row)) if row.is_live() && self.chosen_pane().is_some() => {
-                // Straight onto the pane chosen with Shift ←/→: zellij finds its tab.
+                // Straight onto the pane chosen with Tab: zellij finds its tab.
                 switch_session_with_options(ConnectToSession {
                     name: Some(row.name.clone()),
                     pane_id: self.chosen_pane(),
@@ -768,7 +769,7 @@ impl Panel {
         }
     }
 
-    /// The live pane chosen with Shift ←/→, as zellij names it: `(id, is_plugin)`.
+    /// The live pane chosen with Tab / Shift Tab, as zellij names it: `(id, is_plugin)`.
     fn chosen_pane(&self) -> Option<(u32, bool)> {
         let index = self.pane?;
         let Some(ui::Item::Session(row)) = self.current_item() else {
@@ -792,7 +793,7 @@ impl Panel {
         let panes = self.panes_of_tab();
         let chosen = self.pane.or_else(|| panes.iter().position(|(_, f)| *f)).unwrap_or(0);
         let count = if panes.len() > 1 {
-            format!("  ({}/{} · Shift ←→)", chosen + 1, panes.len())
+            format!("  ({}/{} · Tab)", chosen + 1, panes.len())
         } else {
             String::new()
         };
@@ -853,10 +854,15 @@ impl Panel {
                 // Until an arrow chooses one, the tab shown chosen is the one the session is on.
                 let tabs = self.tabs_of_current();
                 let active = tabs.iter().position(|(_, active)| *active);
+                // The same for the panes: the one the preview shows until Tab chooses.
+                let panes = self.panes_of_tab();
+                let focused = panes.iter().position(|(_, focused)| *focused);
                 ui::Detail::Tabs {
                     name: row.name.clone(),
                     tabs: tabs.into_iter().map(|(n, _)| n).collect(),
                     chosen: self.tab.or(active),
+                    pane: self.pane.or(focused),
+                    panes: panes.into_iter().map(|(n, _)| n).collect(),
                 }
             }
             None => ui::Detail::Text(String::new()),
