@@ -88,6 +88,7 @@ impl ZellijPlugin for State {
                 EventType::SavedSessionPreview,
                 EventType::GlobalAttentionUpdate,
                 EventType::Timer,
+                EventType::Visible,
             ]);
             return;
         }
@@ -235,6 +236,10 @@ struct Panel {
     mode: Mode,
     message: Option<String>,
     asked: bool,
+    /// Hidden (floating panes toggled off, another tab): the preview is not asked for.
+    hidden: bool,
+    /// A key has reached the panel — it is in use, not a leftover of a saved session.
+    touched: bool,
     palette: Option<ui::Palette>,
     /// x, y, width, height — from the configuration, or `SIZE`.
     geometry: [String; 4],
@@ -290,13 +295,35 @@ impl Panel {
                 changed
             }
             // The preview of a live session follows what its pane does: asked again each second
-            // while the panel is open.
+            // while the panel is open and seen. Hidden, the chain stops; `Visible(true)` restarts it.
             Event::Timer(_) => {
-                self.ask_preview();
-                set_timeout(1.0);
+                if !self.hidden {
+                    self.ask_preview();
+                    set_timeout(1.0);
+                }
                 false
             }
+            // zellij says `Visible(false)` when the pane is hidden, and also when it was loaded
+            // hidden — the panel saved in a session's layout (zellij serializes floating panes) and
+            // brought back by a restart or a resurrection. Nobody opened that one: it closes, so it
+            // does not come back on every restart, and it does not sit asking for previews.
+            Event::Visible(false) => {
+                if !self.touched {
+                    close_self();
+                }
+                self.hidden = true;
+                false
+            }
+            Event::Visible(true) => {
+                if self.hidden {
+                    self.hidden = false;
+                    self.ask_preview();
+                    set_timeout(1.0);
+                }
+                true
+            }
             Event::Key(key) => {
+                self.touched = true;
                 let changed = self.key(key);
                 self.ask_preview();
                 changed

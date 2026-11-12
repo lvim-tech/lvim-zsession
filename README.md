@@ -37,8 +37,13 @@ session list — zellij's session-manager with what it leaves out:
 - **attention**: zellij's own tracker (`GlobalAttentionUpdate`) per live session — `● needs you`,
   `✗ failed`, `✓ done`, `◐ working` — in the ATTENTION column;
 - **a preview** under the tabs line: the chosen tab's pane as it is on the screen now, in its own
-  colours, re-read every second (`get_session_preview`); for a saved session, the panes the tab
+  colours, re-read every second (`get_session_preview`) while the panel is seen — hidden (floating
+  panes toggled off, another tab), it stops asking; for a saved session, the panes the tab
   brings back with their commands and folders (and the last screen, when zellij kept it).
+
+zellij saves floating panes with the session, so a panel open at a save comes back, hidden, after
+a restart or a resurrection. That one closes itself (`Visible(false)` before any key reached it):
+nobody opened it, and left alone it would come back on every restart.
 
 It is drawn like lvim-zclaude's board — the same size (80%×70%, `x`/`y`/`width`/`height` in the
 configuration change it), colours taken only from the active zellij theme, columns ST · SESSION ·
