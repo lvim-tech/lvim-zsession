@@ -240,6 +240,10 @@ struct Panel {
     hidden: bool,
     /// A key has reached the panel — it is in use, not a leftover of a saved session.
     touched: bool,
+    /// zellij has said `Visible(true)` at least once.
+    shown: bool,
+    /// The one-second timer chain runs (started by `first_look`, stopped while hidden).
+    ticking: bool,
     palette: Option<ui::Palette>,
     /// x, y, width, height — from the configuration, or `SIZE`.
     geometry: [String; 4],
@@ -296,27 +300,33 @@ impl Panel {
             }
             // The preview of a live session follows what its pane does: asked again each second
             // while the panel is open and seen. Hidden, the chain stops; `Visible(true)` restarts it.
+            //
+            // A panel still hidden at a tick that was never shown and never got a key was loaded
+            // hidden: the panel saved in a session's layout (zellij serializes floating panes) and
+            // brought back by a restart or a resurrection. Nobody opened that one: it closes, so it
+            // does not come back on every restart. Not at `Visible(false)` itself — a panel just
+            // launched gets that too, for a moment, before zellij shows it (`Visible(true)`).
             Event::Timer(_) => {
-                if !self.hidden {
+                if self.hidden {
+                    self.ticking = false;
+                    if !self.shown && !self.touched {
+                        close_self();
+                    }
+                } else {
                     self.ask_preview();
                     set_timeout(1.0);
                 }
                 false
             }
-            // zellij says `Visible(false)` when the pane is hidden, and also when it was loaded
-            // hidden — the panel saved in a session's layout (zellij serializes floating panes) and
-            // brought back by a restart or a resurrection. Nobody opened that one: it closes, so it
-            // does not come back on every restart, and it does not sit asking for previews.
             Event::Visible(false) => {
-                if !self.touched {
-                    close_self();
-                }
                 self.hidden = true;
                 false
             }
             Event::Visible(true) => {
-                if self.hidden {
-                    self.hidden = false;
+                self.hidden = false;
+                self.shown = true;
+                if !self.ticking {
+                    self.ticking = true;
                     self.ask_preview();
                     set_timeout(1.0);
                 }
@@ -349,6 +359,7 @@ impl Panel {
             change_floating_panes_coordinates(vec![(PaneId::Plugin(own), coordinates)]);
         }
         pipe_message_to_plugin(MessageToPlugin::new("lvim-zclaude-summary-request"));
+        self.ticking = true;
         set_timeout(1.0);
         match get_session_list() {
             Ok(snapshot) => {
